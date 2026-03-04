@@ -7,7 +7,7 @@ import {IPrivateERC20} from "./IPrivateERC20.sol";
 import {ITokenReceiver} from "./ITokenReceiver.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ERC165} from "@openzeppelin/contracts/utils/introspection/ERC165.sol";
-import "../../utils/mpc/MpcCore.sol";
+import "../utils/mpc/MpcCore.sol";
 
 /*
 THIS IS THE 256 BIT VERSION OF PRIVATE ERC20.
@@ -118,13 +118,29 @@ abstract contract PrivateERC20 is
         return 0;
     }
 
-    function mint(address to, uint256 amount) public virtual onlyRole(MINTER_ROLE) {
+    function mint(
+        address to,
+        uint256 amount
+    ) public virtual onlyRole(MINTER_ROLE) {
         gtUint256 gtAmount = MpcCore.setPublic256(amount);
         _mint(to, gtAmount);
     }
 
-    function burn(uint256 amount) public {
+    function mint(
+        address to,
+        itUint256 calldata amount
+    ) public virtual onlyRole(MINTER_ROLE) {
+        gtUint256 gtAmount = MpcCore.validateCiphertext(amount);
+        _mint(to, gtAmount);
+    }
+
+    function burn(uint256 amount) public virtual {
         gtUint256 gtAmount = MpcCore.setPublic256(amount);
+        _burn(msg.sender, gtAmount);
+    }
+
+    function burn(itUint256 calldata amount) public virtual {
+        gtUint256 gtAmount = MpcCore.validateCiphertext(amount);
         _burn(msg.sender, gtAmount);
     }
 
@@ -233,6 +249,27 @@ abstract contract PrivateERC20 is
     }
 
     /**
+     * @dev See {IPrivateERC20-transferPublic}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `value`.
+     */
+    function transferPublic(
+        address to,
+        uint256 value
+    ) public virtual returns (bool) {
+        address owner = _msgSender();
+
+        gtUint256 gtValue = MpcCore.setPublic256(value);
+
+        gtBool success = _transfer(owner, to, gtValue);
+
+        return MpcCore.decrypt(success);
+    }
+
+    /**
      * @dev See {IPrivateERC20-allowance}.
      */
     function allowance(
@@ -326,6 +363,26 @@ abstract contract PrivateERC20 is
     }
 
     /**
+     * @dev See {IPrivateERC20-approvePublic}.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approvePublic(
+        address spender,
+        uint256 value
+    ) public virtual returns (bool) {
+        address owner = _msgSender();
+
+        gtUint256 gtValue = MpcCore.setPublic256(value);
+
+        _approve(owner, spender, gtValue);
+
+        return true;
+    }
+
+    /**
      * @dev See {IPrivateERC20-transferFrom}.
      *
      * Requirements:
@@ -369,6 +426,32 @@ abstract contract PrivateERC20 is
         _spendAllowance(from, spender, value);
 
         return _transfer(from, to, value);
+    }
+
+    /**
+     * @dev See {IPrivateERC20-transferFromPublic}.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `value`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `value`.
+     */
+    function transferFromPublic(
+        address from,
+        address to,
+        uint256 value
+    ) public virtual returns (bool) {
+        address spender = _msgSender();
+
+        gtUint256 gtValue = MpcCore.setPublic256(value);
+
+        _spendAllowance(from, spender, gtValue);
+
+        gtBool success = _transfer(from, to, gtValue);
+
+        return MpcCore.decrypt(success);
     }
 
     /**
@@ -450,12 +533,31 @@ abstract contract PrivateERC20 is
             _updateBalance(to, newToBalance);
         }
 
-        emit Transfer(
-            from,
-            to,
-            MpcCore.offBoardToUser(valueTransferred, from),
-            MpcCore.offBoardToUser(valueTransferred, to)
-        );
+        // When minting or transferring to/from a smart contract (which has no AES key),
+        // we must bypass offBoardToUser to prevent on-chain reverts.
+        ctUint256 memory senderCt;
+        address fromEnc = _getAccountEncryptionAddress(from);
+        if (fromEnc != address(0)) {
+            senderCt = MpcCore.offBoardToUser(valueTransferred, fromEnc);
+        } else {
+            senderCt = ctUint256({
+                ciphertextHigh: ctUint128.wrap(0),
+                ciphertextLow: ctUint128.wrap(0)
+            });
+        }
+
+        ctUint256 memory receiverCt;
+        address toEnc = _getAccountEncryptionAddress(to);
+        if (toEnc != address(0)) {
+            receiverCt = MpcCore.offBoardToUser(valueTransferred, toEnc);
+        } else {
+            receiverCt = ctUint256({
+                ciphertextHigh: ctUint128.wrap(0),
+                ciphertextLow: ctUint128.wrap(0)
+            });
+        }
+
+        emit Transfer(from, to, senderCt, receiverCt);
 
         return result;
     }
@@ -469,9 +571,16 @@ abstract contract PrivateERC20 is
     function _getAccountEncryptionAddress(
         address account
     ) internal view returns (address) {
+        if (account == address(0)) return address(0);
+
         address encryptionAddress = _accountEncryptionAddress[account];
 
         if (encryptionAddress == address(0)) {
+            if (account.code.length > 0) {
+                // Smart contracts don't have AES keys, so we return address(0)
+                // as a signal to bypass encryption in offBoardToUser.
+                return address(0);
+            }
             encryptionAddress = account;
         }
 
@@ -551,17 +660,30 @@ abstract contract PrivateERC20 is
 
         address encryptionAddress = _getAccountEncryptionAddress(owner);
 
-        ctUint256 memory ownerCiphertext = MpcCore.offBoardToUser(
-            value,
-            encryptionAddress
-        );
+        ctUint256 memory ownerCiphertext;
+        if (encryptionAddress != address(0)) {
+            ownerCiphertext = MpcCore.offBoardToUser(value, encryptionAddress);
+        } else {
+            ownerCiphertext = ctUint256({
+                ciphertextHigh: ctUint128.wrap(0),
+                ciphertextLow: ctUint128.wrap(0)
+            });
+        }
 
         encryptionAddress = _getAccountEncryptionAddress(spender);
 
-        ctUint256 memory spenderCiphertext = MpcCore.offBoardToUser(
-            value,
-            encryptionAddress
-        );
+        ctUint256 memory spenderCiphertext;
+        if (encryptionAddress != address(0)) {
+            spenderCiphertext = MpcCore.offBoardToUser(
+                value,
+                encryptionAddress
+            );
+        } else {
+            spenderCiphertext = ctUint256({
+                ciphertextHigh: ctUint128.wrap(0),
+                ciphertextLow: ctUint128.wrap(0)
+            });
+        }
 
         _allowances[owner][spender] = Allowance(
             ciphertext,
@@ -608,9 +730,7 @@ abstract contract PrivateERC20 is
         _approve(owner, spender, newAllowance);
     }
 
-    function _safeOnboard(
-        ctUint256 memory value
-    ) internal returns (gtUint256) {
+    function _safeOnboard(ctUint256 memory value) internal returns (gtUint256) {
         // If both 128-bit ciphertext halves are zero, treat as public zero
         if (
             ctUint128.unwrap(value.ciphertextHigh) == 0 &&
