@@ -121,14 +121,50 @@ abstract contract PrivateERC20 is
     function mint(
         address to,
         uint256 amount
-    ) public virtual onlyRole(MINTER_ROLE) {
+    ) public virtual override onlyRole(MINTER_ROLE) returns (bool) {
         gtUint256 gtAmount = MpcCore.setPublic256(amount);
-        _mint(to, gtAmount);
+        gtBool success = _mint(to, gtAmount);
+
+        return MpcCore.decrypt(success);
     }
 
-    function burn(uint256 amount) public {
+    /**
+     * @dev Mint an already-garbled amount without re-wrapping.
+     * Intended for contract-to-contract flows that already hold a gtUint256.
+     */
+    function mintGt(
+        address to,
+        gtUint256 gtAmount
+    ) public virtual onlyRole(MINTER_ROLE) returns (gtBool) {
+        return _mint(to, gtAmount);
+    }
+
+    function mint(
+        address to,
+        itUint256 calldata amount
+    ) public virtual override onlyRole(MINTER_ROLE) returns (gtBool) {
+        gtUint256 gtAmount = MpcCore.validateCiphertext(amount);
+        return _mint(to, gtAmount);
+    }
+
+    function burn(uint256 amount) public virtual override returns (bool) {
         gtUint256 gtAmount = MpcCore.setPublic256(amount);
-        _burn(msg.sender, gtAmount);
+        gtBool success = _burn(msg.sender, gtAmount);
+
+        return MpcCore.decrypt(success);
+    }
+
+    /**
+     * @dev Burn an already-garbled amount without re-wrapping.
+     * Intended for contract-to-contract flows that already hold a gtUint256.
+     */
+    function burnGt(gtUint256 gtAmount) public virtual returns (gtBool) {
+        return _burn(msg.sender,gtAmount);
+    }
+
+    function burn(itUint256 calldata amount) public virtual override returns (gtBool) {
+        gtUint256 gtAmount = MpcCore.validateCiphertext(amount);
+        return _burn(msg.sender, gtAmount);
     }
 
     function transferAndCall(
@@ -136,17 +172,34 @@ abstract contract PrivateERC20 is
         uint256 amount,
         bytes calldata data
     ) public virtual returns (bool) {
-        gtUint256 gtAmount = MpcCore.setPublic256(amount);
-        gtBool success = _transfer(msg.sender, to, gtAmount);
-        require(MpcCore.decrypt(success), "Transfer failed");
-
         if (to.code.length > 0) {
             require(
                 ITokenReceiver(to).onTokenReceived(msg.sender, amount, data),
                 "Callback failed"
             );
         }
-        return true;
+
+        gtUint256 gtAmount = MpcCore.setPublic256(amount);
+        gtBool success = _transfer(msg.sender, to, gtAmount);
+        require(MpcCore.decrypt(success), "Transfer failed");
+
+        return success;
+    }
+
+    function transferAndCall(
+        address to,
+        itUint256 amount,
+        bytes calldata data
+    ) public virtual returns (gtBool) {
+        if (to.code.length > 0) {
+            require(
+                ITokenReceiver(to).onTokenReceived(msg.sender, amount, data),
+                "Callback failed"
+            );
+        }
+
+        gtUint256 gtAmount = MpcCore.validateCipherText(amount);
+        return _transfer(msg.sender, to, gtAmount);
     }
 
     function supportsInterface(
@@ -207,10 +260,11 @@ abstract contract PrivateERC20 is
      * - `to` cannot be the zero address.
      * - the caller must have a balance of at least `value`.
      */
+    /// @notice Transfer with encrypted (itUint256) amount
     function transfer(
         address to,
         itUint256 calldata value
-    ) public virtual returns (gtBool) {
+    ) public virtual override returns (gtBool) {
         address owner = _msgSender();
 
         gtUint256 gtValue = MpcCore.validateCiphertext(value);
@@ -218,21 +272,28 @@ abstract contract PrivateERC20 is
         return _transfer(owner, to, gtValue);
     }
 
-    /**
-     * @dev See {IPrivateERC20-transfer}.
-     *
-     * Requirements:
-     *
-     * - `to` cannot be the zero address.
-     * - the caller must have a balance of at least `value`.
-     */
-    function transfer(
+    /// @notice Transfer with garbled-text (gtUint256) amount
+    function TransferGT(
         address to,
         gtUint256 value
     ) public virtual returns (gtBool) {
         address owner = _msgSender();
 
         return _transfer(owner, to, value);
+    }
+
+    /// @notice Transfer with plain public uint256 amount
+    function transfer(
+        address to,
+        uint256 value
+    ) public virtual override returns (bool) {
+        address owner = _msgSender();
+
+        gtUint256 gtValue = MpcCore.setPublic256(value);
+
+        gtBool success = _transfer(owner, to, gtValue);
+
+        return MpcCore.decrypt(success);
     }
 
     /**
@@ -294,6 +355,7 @@ abstract contract PrivateERC20 is
      *
      * - `spender` cannot be the zero address.
      */
+    /// @notice Approve with encrypted (itUint256) amount
     function approve(
         address spender,
         itUint256 calldata value
@@ -307,23 +369,28 @@ abstract contract PrivateERC20 is
         return true;
     }
 
-    /**
-     * @dev See {IPrivateERC20-approve}.
-     *
-     * NOTE: If `value` is the maximum `gtUint256`, the allowance is not updated on
-     * `transferFrom`. This is semantically equivalent to an infinite approval.
-     *
-     * Requirements:
-     *
-     * - `spender` cannot be the zero address.
-     */
-    function approve(
+    /// @notice Approve with garbled-text (gtUint256) amount
+    function approveGT(
         address spender,
         gtUint256 value
     ) public virtual returns (bool) {
         address owner = _msgSender();
 
         _approve(owner, spender, value);
+
+        return true;
+    }
+
+    /// @notice Approve with plain public uint256 amount
+    function approve(
+        address spender,
+        uint256 value
+    ) public virtual returns (bool) {
+        address owner = _msgSender();
+
+        gtUint256 gtValue = MpcCore.setPublic256(value);
+
+        _approve(owner, spender, gtValue);
 
         return true;
     }
@@ -338,6 +405,7 @@ abstract contract PrivateERC20 is
      * - the caller must have allowance for ``from``'s tokens of at least
      * `value`.
      */
+    /// @notice transferFrom with encrypted (itUint256) amount
     function transferFrom(
         address from,
         address to,
@@ -352,17 +420,8 @@ abstract contract PrivateERC20 is
         return _transfer(from, to, gtValue);
     }
 
-    /**
-     * @dev See {IPrivateERC20-transferFrom}.
-     *
-     * Requirements:
-     *
-     * - `from` and `to` cannot be the zero address.
-     * - `from` must have a balance of at least `value`.
-     * - the caller must have allowance for ``from``'s tokens of at least
-     * `value`.
-     */
-    function transferFrom(
+    /// @notice transferFrom with garbled-text (gtUint256) amount
+    function TransferFromGT(
         address from,
         address to,
         gtUint256 value
@@ -372,6 +431,24 @@ abstract contract PrivateERC20 is
         _spendAllowance(from, spender, value);
 
         return _transfer(from, to, value);
+    }
+
+
+    /// @notice transferFrom with plain public uint256 amount
+    function transferFrom(
+        address from,
+        address to,
+        uint256 value
+    ) public virtual returns (bool) {
+        address spender = _msgSender();
+
+        gtUint256 gtValue = MpcCore.setPublic256(value);
+
+        _spendAllowance(from, spender, gtValue);
+
+        gtBool success = _transfer(from, to, gtValue);
+
+        return MpcCore.decrypt(success);
     }
 
     /**
