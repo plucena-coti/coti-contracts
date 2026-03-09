@@ -929,13 +929,17 @@ abstract contract PrivateERC20 is
         gtBool insufficientBalance = MpcCore.lt(currentBalance, value);
         gtBool inSufficientAllowance = MpcCore.lt(currentAllowance, value);
 
+        // mux(bit, a, b) returns `a` when bit=true, `b` when bit=false.
+        // When any guard (infinite allowance, insufficient balance, or insufficient allowance)
+        // is true → keep currentAllowance unchanged (a).
+        // Otherwise (normal spend) → decrement the allowance (b).
         gtUint256 newAllowance = MpcCore.mux(
             MpcCore.or(
                 maxAllowance,
                 MpcCore.or(insufficientBalance, inSufficientAllowance)
             ),
-            MpcCore.sub(currentAllowance, value),
-            currentAllowance
+            currentAllowance,
+            MpcCore.sub(currentAllowance, value)
         );
 
         _approve(owner, spender, newAllowance);
