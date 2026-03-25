@@ -4,6 +4,7 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
@@ -14,7 +15,12 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
  *      (3) Owner operations (limits, fees, pause, withdraw fees, rescue) are centralized; consider timelock/multisig for sensitive actions.
  *      (4) Any new derived bridge must override withdrawFees to perform the actual transfer; base implementation reverts.
  */
-abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
+abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable, AccessControl {
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    event OperatorAdded(address indexed account, address indexed by);
+    event OperatorRemoved(address indexed account, address indexed by);
+
     /// @notice Maximum amount that can be deposited in a single transaction
     uint256 public maxDepositAmount;
 
@@ -66,7 +72,6 @@ abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
     error WithdrawExceedsMaximum();
     error InvalidFee();
     error InsufficientAccumulatedFees();
-    error WithdrawFeesMustBeOverridden();
 
     /// @notice Emitted when a user deposits tokens
     /// @param user        Address of the user
@@ -91,14 +96,57 @@ abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
     /// @notice Emitted when fees are updated
     event FeeUpdated(string feeType, uint256 newFeeBasisPoints);
 
+    /// @notice Emitted when deposit enabled state changes
+    event DepositEnabledUpdated(bool enabled);
+
     /// @notice Emitted when accumulated fees are withdrawn
     event FeesWithdrawn(address indexed to, uint256 amount);
+
+    /// @notice Emitted when accumulated native COTI fees are withdrawn
+    event CotiFeesWithdrawn(address indexed to, uint256 amount);
 
     constructor() Ownable() {
         maxDepositAmount = type(uint256).max;
         maxWithdrawAmount = type(uint256).max;
         minDepositAmount = 1;
         minWithdrawAmount = 1;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+    }
+
+    modifier onlyOperator() {
+        _checkRole(OPERATOR_ROLE, msg.sender);
+        _;
+    }
+
+    function addOperator(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (account == address(0)) revert InvalidAddress();
+        _grantRole(OPERATOR_ROLE, account);
+        emit OperatorAdded(account, msg.sender);
+    }
+
+    function removeOperator(address account) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (account == address(0)) revert InvalidAddress();
+        _revokeRole(OPERATOR_ROLE, account);
+        emit OperatorRemoved(account, msg.sender);
+    }
+
+    function isOperator(address account) external view returns (bool) {
+        return hasRole(OPERATOR_ROLE, account);
+    }
+
+    /**
+     * @dev Overrides Ownable's transferOwnership to automatically grant roles to new owner
+     */
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (newOwner == address(0)) revert InvalidAddress();
+        address previousOwner = owner();
+        super.transferOwnership(newOwner);
+        _grantRole(DEFAULT_ADMIN_ROLE, newOwner);
+        _grantRole(OPERATOR_ROLE, newOwner);
+        _revokeRole(DEFAULT_ADMIN_ROLE, previousOwner);
+        _revokeRole(OPERATOR_ROLE, previousOwner);
     }
 
     /**
@@ -168,11 +216,32 @@ abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
+     * @notice Validate all deposit pre-conditions
+     * @param amount The deposit amount to validate
+     * @dev Checks deposit-enabled flag, zero amount, and deposit limits
+     */
+    function _validateDeposit(uint256 amount) internal view {
+        if (!isDepositEnabled) revert DepositDisabled();
+        if (amount == 0) revert AmountZero();
+        _checkDepositLimits(amount);
+    }
+
+    /**
+     * @notice Validate all withdraw pre-conditions
+     * @param amount The withdrawal amount to validate
+     * @dev Checks zero amount and withdrawal limits
+     */
+    function _validateWithdraw(uint256 amount) internal view {
+        if (amount == 0) revert AmountZero();
+        _checkWithdrawLimits(amount);
+    }
+
+    /**
      * @notice Set the deposit fee
      * @param _feeBasisPoints New deposit fee in basis points (max 100,000 = 10%)
-     * @dev Only the owner can call this function
+     * @dev Only the operator can call this function
      */
-    function setDepositFee(uint256 _feeBasisPoints) external onlyOwner {
+    function setDepositFee(uint256 _feeBasisPoints) external onlyOperator {
         if (_feeBasisPoints > MAX_FEE_UNITS) revert InvalidFee();
         depositFeeBasisPoints = _feeBasisPoints;
         emit FeeUpdated("deposit", _feeBasisPoints);
@@ -181,9 +250,9 @@ abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
     /**
      * @notice Set the withdrawal fee
      * @param _feeBasisPoints New withdrawal fee in basis points (max 10% = 100,000)
-     * @dev Only the owner can call this function
+     * @dev Only the operator can call this function
      */
-    function setWithdrawFee(uint256 _feeBasisPoints) external onlyOwner {
+    function setWithdrawFee(uint256 _feeBasisPoints) external onlyOperator {
         if (_feeBasisPoints > MAX_FEE_UNITS) revert InvalidFee();
         withdrawFeeBasisPoints = _feeBasisPoints;
         emit FeeUpdated("withdraw", _feeBasisPoints);
@@ -192,18 +261,21 @@ abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
     /**
      * @notice Toggle deposit functionality
      * @param _enabled True to enable, false to disable
+     * @dev Only the operator can call this function
      */
-    function setIsDepositEnabled(bool _enabled) external onlyOwner {
+    function setIsDepositEnabled(bool _enabled) external onlyOperator {
         isDepositEnabled = _enabled;
+        emit DepositEnabledUpdated(_enabled);
     }
 
     /**
      * @notice Set the native COTI fee
      * @param _fee Amount in native tokens (wei-equivalent)
-     * @dev Used by ERC20 bridges: they require msg.value >= this value and refund excess to the caller (best-effort).
+     * @dev Used by ERC20 bridges: they require msg.value >= this value and refund excess to the caller (best-effort). Only the operator can call this function.
      */
-    function setNativeCotiFee(uint256 _fee) external onlyOwner {
+    function setNativeCotiFee(uint256 _fee) external virtual onlyOperator {
         nativeCotiFee = _fee;
+        emit FeeUpdated("nativeCoti", _fee);
     }
 
     /**
@@ -224,27 +296,21 @@ abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
      * @notice Withdraw accumulated fees
      * @param to Address to send the fees to
      * @param amount Amount of fees to withdraw
-     * @dev Only the owner can call this function. Must be overridden in derived contracts
-     *      to perform the actual token/native transfer; base implementation reverts.
+     * @dev Must be implemented by derived contracts to perform the actual transfer.
      */
     function withdrawFees(
         address to,
         uint256 amount
-    ) external virtual onlyOwner {
-        if (to == address(0)) revert InvalidAddress();
-        if (amount == 0) revert AmountZero();
-        if (amount > accumulatedFees) revert InsufficientAccumulatedFees();
-        revert WithdrawFeesMustBeOverridden();
-    }
+    ) external virtual;
 
     /**
      * @notice Withdraw accumulated native COTI fees
      * @param to Address to send the native COTI fees to
      * @param amount Amount of native COTI fees to withdraw
-     * @dev Only the owner can call this function. Derived ERC20 bridges use this inherited implementation to withdraw
+     * @dev Only the operator can call this function. Derived ERC20 bridges use this inherited implementation to withdraw
      *      accumulated native COTI fees; native bridge does not use this (accumulatedCotiFees remains 0).
      */
-    function withdrawCotiFees(address to, uint256 amount) external onlyOwner {
+    function withdrawCotiFees(address to, uint256 amount) external onlyOperator nonReentrant {
         if (to == address(0)) revert InvalidAddress();
         if (amount == 0) revert AmountZero();
         if (amount > accumulatedCotiFees) revert InsufficientAccumulatedFees();
@@ -254,5 +320,7 @@ abstract contract PrivacyBridge is ReentrancyGuard, Pausable, Ownable {
 
         (bool success, ) = to.call{value: amount}("");
         if (!success) revert EthTransferFailed();
+
+        emit CotiFeesWithdrawn(to, amount);
     }
 }
